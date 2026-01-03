@@ -1,0 +1,394 @@
+Executing Kube-bench using custom config files
+
+kube-bench --benchmark cis-1.10 --config-dir /opt/kube-bench/cfg run --targets node
+kube-bench run --targets master --check 1.2.15
+
+sudo groupadd --system etcd
+sudo useradd -s /sbin/nologin --system -g etcd etcd
+
+
+
+Ingerss
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rocket-ingress
+  namespace: space
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - rocket-server.local
+      secretName: rocket-tls
+  rules:
+    - host: rocket-server.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: rocket-server
+                port:
+                  number: 80
+
+curl -k https://rocket-server.local
+echo "<INGRESS-IP> rocket-server.local" | sudo tee -a /etc/hosts
+kubectl -n world create secret tls ingress-tls --key cert.key --cert cert.crt
+
+annotations:
+    # this annotation removes the need for a trailing slash when calling urls
+    # but it is not necessary for solving this scenario
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ss-redirect: false
+
+
+Cilium Network Policy
+
+apiVersion: "cilium.io/v2"
+kind: CiliumNetworkPolicy
+metadata:
+  name: p1
+  namespace: team-azure
+spec:
+  endpointSelector:
+    matchLabels:
+      role: messenger
+  egressDeny:
+  - toEndpoints:
+    - matchLabels:
+
+Deny Network Policy
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-out
+  namespace: app
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+  egress:
+  - ports:
+    - port: 53
+      protocol: TCP
+    - port: 53
+      protocol: UDP
+
+
+Create the NP where we allow traffic to all addresses, except the evil one
+
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: metadata-server
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      trust: nope
+  policyTypes:
+  - Egress
+  egress:
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+          - 1.1.1.1/32
+
+
+
+Enable POD Security Standards in NS
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  labels:
+    kubernetes.io/metadata.name: team-red
+    pod-security.kubernetes.io/enforce: baseline # add
+  name: team-red
+
+
+Enable Istio Encryption in NS
+
+kubectl label namespace encrypted istio-injection=enabled --overwrite
+
+
+Apply PeerAuthentication policy for STRICT mTLS:
+cat <<EOF | kubectl apply -f -
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: encrypted
+spec:
+  mtls:
+    mode: STRICT
+EOF
+
+
+Secure Docker service
+
+Change the ownership of the docker file:
+
+sudo chown root:root /var/run/docker.sock
+
+Then add --group=root to the ExecStart of docker systemd file:
+
+sudo systemctl edit docker
+[Service]
+ExecStart=
+ExecStart=/usr/bin/dockerd --group=root
+
+Then reload the docker daemon:
+sudo systemctl daemon-reexec 
+sudo systemctl daemon-reload 
+sudo systemctl restart docker
+
+To remove the TCP external connections, modify the /etc/docker/daemon.json to remove the tcp section so that the file looks like this:
+{
+  "hosts": ["unix:///var/run/docker.sock"]
+}
+
+
+
+Enable ImagePolicyWebhook Admission controller
+
+Update /etc/kubernetes/manifests/kube-apiserver.yaml as below
+    - --enable-admission-plugins=NodeRestriction,ImagePolicyWebhook
+    - --admission-control-config-file=/etc/kubernetes/pki/admission_configuration.yaml
+
+
+
+
+Configure the kubelet on the cluster2-controlplane node to disallow anonymous authentication.
+
+sudo nano /var/lib/kubelet/config.yaml
+and change the authentication.anonymous.enabled to false:
+authentication:
+  anonymous:
+    enabled: false
+and authorization.mode to Webhook:
+authorization:
+  mode: Webhook
+
+
+
+Generate SSL certs, sign and provide access to the cluster
+
+openssl genrsa -out 60099.key 2048
+openssl req -new -key 60099.key -out 60099.csr
+#manual Signing using cluster CA
+openssl x509 -req -in 60099.csr -CA /etc/kubernetes/pki/ca.crt -CAkey /etc/kubernetes/pki/ca.key -CAcreateserial -out 60099.crt -days 500 
+
+Sign the csr using API
+
+Create and approve
+k -f csr.yaml create
+k get csr # pending
+k certificate approve 60099@internal.users
+k get csr # approved
+
+
+
+Set credentials in kubeconfig file
+k config set-credentials 60099@internal.users --client-key=60099.key --client-certificate=60099.crt
+k config set-context 60099@internal.users --cluster=kubernetes --user=60099@internal.users
+k config get-contexts
+k config use-context 60099@internal.users
+
+
+
+Hardening Container Image
+
+Before hardening
+
+FROM ubuntu:
+RUN apt-get update
+RUN apt-get -y install curl
+ENV URL https://google.com/this-will-fail?secret-token=
+CMD ["sh", "-c", "curl --head $URL=2e064aad-3a90-4cde-ad86-16fad1f8943e "]
+
+After hardening 
+
+FROM ubuntu:20.04                                                                     # Specific version
+RUN apt-get update && apt-get -y install curl                        # update and install command should run together to prevent update layer caching issue
+ENV URL https://google.com/this-will-fail?secret-token=     
+RUN rm /usr/bin/bash                                                                # remove bash binaries to ensure noone can access bash in this container
+CMD ["sh", "-c", "curl --head $URL$TOKEN"]                          # Remove hardcoded tokens, instead use variable 
+
+
+podman build -t app .
+podman run -d -e TOKEN=2e064aad-3a90-4cde-ad86-16fad1f8943e app sleep 1d # run in background
+podman exec -it 4a848daec2e2 bash # fails
+podman exec -it 4a848daec2e2 sh # works
+
+
+Now by-default this container will run as root,  harden the container image to use appuser instead of ROOT
+
+
+FROM ubuntu:20.04
+RUN apt-get update && apt-get -y install curl
+ENV URL https://google.com/this-will-fail?secret-token= 
+RUN rm /usr/bin/bash
+RUN adduser -D -g '' appuser                                                         # create app user 
+USER appuser                                                                                      # USER can be set to app user
+CMD ["sh", "-c", "curl --head $URL$TOKEN"]
+
+
+docker build -t base-image .
+docker run --name c2 -d base-image
+Show the user of processes
+docker exec c2 ps
+
+
+Running containers in same kernel namespace
+
+docker run --name app1 -d nginx:alpine sleep infinity
+
+We only see the processes of container app1
+docker exec app1 ps aux
+
+Run second container in first containers PID namespace
+docker run --name app2 --pid=container:app1 -d nginx:alpine sleep infinity
+
+Run third container in first containers PID namespace
+docker run --name app3 --pid=container:app1 -d nginx:alpine sleep 1d
+
+
+Using Image Digest to ensure proper image is used
+
+k run crazy-pod --image=nginx@sha256:eb05700fe7baa6890b74278e39b66b2ed1326831f9ec3ed4bdc6361a4ac2f333
+
+
+Use trivy to scan images for known vulnerabilities
+
+Trivy image <image-name>
+trivy image nginx:1.19.1-alpine-perl | grep CVE-2021-28831
+
+
+Create a Pod with read-only filesystem
+
+spec:
+      containers:
+      - command:
+        - sh
+        - -c
+        - date > /etc/date.log && sleep 1d
+        image: busybox:1.32.0
+        name: container
+        securityContext:
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - mountPath: /etc
+          name: temp
+      volumes:
+      - name: temp
+        emptyDir: {}
+
+
+Create a Pod with PrivilegeEscalation false
+
+spec:
+      containers:
+      - image: httpd:2.4.52-alpine
+        name: httpd
+        securityContext:
+            allowPrivilegeEscalation: false
+
+Create a Privileged POD
+
+
+pec:
+  containers:
+  - command:
+    - sh
+    - -c
+    - sleep 1d
+    image: nginx:alpine
+    name: prime
+    securityContext:
+      privileged: true
+
+
+RBAC Policies
+
+k create clusterrolebinding pipeline-view --clusterrole view --serviceaccount ns1:pipeline --serviceaccount ns2:pipeline
+k create clusterrole pipeline-deployment-manager --verb create,delete --resource deployments
+# instead of one ClusterRole we could also create the same Role in both Namespaces
+# we can also assign clusterroles in normal rolebindings 
+k -n ns1 create rolebinding pipeline-deployment-manager --clusterrole pipeline-deployment-manager --serviceaccount ns1:pipeline
+k -n ns2 create rolebinding pipeline-deployment-manager --clusterrole pipeline-deployment-manager --serviceaccount ns2:pipeline
+
+k -n applications create rolebinding smoke-view --clusterrole view --user smoke
+k -n default create rolebinding smoke-view --clusterrole view --user smoke
+k -n kube-node-lease create rolebinding smoke-view --clusterrole view --user smoke
+k -n kube-public create rolebinding smoke-view --clusterrole view --user smoke
+
+Container Runtime gVisor
+
+First we create the RuntimeClass
+
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc
+
+And the Pod that uses it
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sec
+spec:
+  runtimeClassName: gvisor
+
+Secret etcd Encryption
+
+echo -n this-is-very-sec | base64
+
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+    - secrets
+    providers:
+    - aesgcm:
+        keys:
+        - name: key1
+          secret: dGhpcy1pcy12ZXJ5LXNlYw==
+    - identity: {}
+
+
+1. Add a new volume and volumeMount in /etc/kubernetes/manifests/kube-apiserver.yaml, so that the container can access the file.
+2. Pass the new file as argument: --encryption-provider-config=/etc/kubernetes/etcd/ec.yaml
+spec:
+  containers:
+  - command:
+    - kube-apiserver
+...
+    - --encryption-provider-config=/etc/kubernetes/etcd/ec.yaml
+...
+    volumeMounts:
+    - mountPath: /etc/kubernetes/etcd
+      name: etcd
+      readOnly: true
+...
+  volumes:
+  - hostPath:
+      path: /etc/kubernetes/etcd
+      type: DirectoryOrCreate
+    name: etcd
+
+
+Encrypt existing Secrets
+
+kubectl -n one get secrets -o json | kubectl replace -f -
+kubectl -n two get secrets -o json | kubectl replace -f -
+kubectl -n three get secrets -o json | kubectl replace -f -
+
