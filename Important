@@ -392,3 +392,135 @@ kubectl -n one get secrets -o json | kubectl replace -f -
 kubectl -n two get secrets -o json | kubectl replace -f -
 kubectl -n three get secrets -o json | kubectl replace -f -
 
+Use Secrets in PODS using env and volume
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod1
+spec:
+  volumes:
+  - name: diver
+    secret:
+      secretName: diver
+  containers:
+  - image: nginx
+    name: pod1
+    volumeMounts:
+      - name: diver
+        mountPath: /etc/diver
+    env:
+      - name: HOLY
+        valueFrom:
+          secretKeyRef:
+            name: holy
+            key: creditcard
+
+
+ServiceAccount Token AutoMounting Disable
+
+Sa yaml
+
+
+apiVersion: v1
+kind: ServiceAccount
+automountServiceAccountToken: false
+metadata:
+
+
+With Pod
+spec:
+  serviceAccountName: custom
+  automountServiceAccountToken: false
+  containers:
+  - name: webserver
+...
+
+Dockerfile Static Analysis
+
+
+File app1-214422c7-Dockerfile uses multiple stages, a larger for building and a smaller for running. This means it uses a Ubuntu stage for building and an Alpine stage for running. The shipped application will run on Alpine instead of Ubuntu. Because Alpine has a much smaller footprint it provides for example fewer pre-installed applications which could be counted as a possible attack surface.
+
+File app2-2782517e-Dockerfile creates a new user and doesn't run the application as root. Not running a containerised application as root can provide security advantages if for example attackers are able to perform remote-code executions, because these would then be executed under a less privileged user instead of root.
+mv /root/apps/app2-5cde5c3d-Dockerfile /root/insecure
+
+File app3-4049a117-Dockerfile stores the temporarily used token at /tmp/token .
+This is persisted as layer in the container even though the file is later deleted.
+
+
+Syscall Analysis using Strace
+
+Strace kill -9 1234 
+Strace kill -9 2>&1 | grep 1234
+
+Ps aux | grep kube-apiserver 
+
+Strace -p <PID of service> -f 
+Strace -p <PID> -f -cw
+
+strace -p 19890 -f # use your PID
+# we use -f for "follow forks"
+
+Well, that's a bit much. Let's count and summarise
+
+strace -p 19890 -f -cw # use your PID
+# run for a bit, then abort with Ctrl+C
+# we should see a nice list of all syscalls.
+
+
+kill -15      → send graceful stop
+strace        → show kernel interaction
+2>&1          → merge output streams
+grep 1234     → focus on target PID
+
+
+3️⃣ 2>&1 (Critical Piece)
+What it does
+	• Redirects stderr (2) → stdout (1)
+Why needed?
+	• strace writes output to stderr
+	• grep reads stdout only
+	• Without this, grep sees nothing
+🧠 Memory hook:
+	“strace talks on stderr — merge the streams”
+
+
+System Hardening and closing ports for services
+
+Find the running service for any port 
+
+Netstat -tulpan | grep 1234
+
+Kill -9 PID
+
+Find the library for that process and remove the library 
+
+Cat /proc/<PID>/exe 
+
+netstat -tulpan | grep 1234
+# using lsof
+lsof -i :1234
+Find pull path
+ls -l /proc/17773/exe # use your ID instead
+Kill and delete
+kill 17773 # use your ID instead
+rm /usr/bin/app1
+
+
+Remove Packages
+
+apt show kube-bench
+apt remove kube-bench
+
+Verify Platform Binaries
+
+Identify where the package is using whereis command
+
+VERSION=$(kubelet --version | cut -d ' ' -f2)
+wget https://dl.k8s.io/$VERSION/kubernetes-server-linux-amd64.tar.gz
+tar xzf kubernetes-server-linux-amd64.tar.gz
+
+Whereis kubelet
+/usr/bin/kubelet
+
+
